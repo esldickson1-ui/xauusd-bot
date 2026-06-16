@@ -1,8 +1,3 @@
-"""
-XAUUSD Smart Money Signal Bot v3 — No pandas/numpy (pure Python)
-Sends BUY/SELL signals to Telegram with full details + chart link
-"""
-
 import os
 import asyncio
 import logging
@@ -14,22 +9,13 @@ from telegram.constants import ParseMode
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 TWELVE_DATA_KEY   = os.environ["TWELVE_DATA_KEY"]
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL", "300"))
-
 RISK_REWARD       = 2.0
 ATR_SL_MULT       = 1.5
-
-last_signal_key   = ""
-
-# ═══════════════════════════════════════════════════════════════════
-# PURE PYTHON MATH HELPERS
-# ═══════════════════════════════════════════════════════════════════
-
-def mean(data):
+last_signal_key   = ""def mean(data):
     return sum(data) / len(data) if data else 0
 
 def ema(prices, period):
@@ -71,13 +57,7 @@ def swing_high(highs, lookback=20):
     return max(highs[-lookback:]) if len(highs) >= lookback else max(highs)
 
 def swing_low(lows, lookback=20):
-    return min(lows[-lookback:]) if len(lows) >= lookback else min(lows)
-
-# ═══════════════════════════════════════════════════════════════════
-# DATA FETCHING
-# ═══════════════════════════════════════════════════════════════════
-
-async def fetch_ohlcv(session, interval="5min", bars=100):
+    return min(lows[-lookback:]) if len(lows) >= lookback else min(lows)async def fetch_ohlcv(session, interval="5min", bars=100):
     url = (
         f"https://api.twelvedata.com/time_series"
         f"?symbol=XAU/USD&interval={interval}&outputsize={bars}"
@@ -85,138 +65,37 @@ async def fetch_ohlcv(session, interval="5min", bars=100):
     )
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
         data = await r.json()
-    
     if "values" not in data:
         raise RuntimeError(f"TwelveData error [{interval}]: {data.get('message','no values')}")
-    
-    rows  = sorted(data["values"], key=lambda x: x["datetime"])
+    rows   = sorted(data["values"], key=lambda x: x["datetime"])
     opens  = [float(x["open"])  for x in rows]
-    highs  = [float(x["high"])  for x in rows]
-    lows   = [float(x["low"])   for x in rows]
-    closes = [float(x["close"]) for x in rows]
-    return opens, highs, lows, closes
-
-async def fetch_all(session):
-    m5  = await fetch_ohlcv(session, "5min",  100)
-    await asyncio.sleep(1)
-    m15 = await fetch_ohlcv(session, "15min", 100)
-    await asyncio.sleep(1)
-    h1  = await fetch_ohlcv(session, "1h",    60)
-    return m5, m15, h1
-
-# ═══════════════════════════════════════════════════════════════════
-# ANALYSIS
-# ═══════════════════════════════════════════════════════════════════
-
-def htf_bias(h1):
-    _, _, _, closes = h1
-    e200 = ema(closes, min(200, len(closes)-1))
-    price = closes[-1]
-    if price > e200 * 1.001: return "bull"
-    if price < e200 * 0.999: return "bear"
-    return "neutral"
-
-def detect_bos(ohlcv, lookback=20):
-    _, highs, lows, closes = ohlcv
-    sh = swing_high(highs, lookback)
-    sl_ = swing_low(lows,  lookback)
-    last  = closes[-1]
-    prev  = closes[-2] if len(closes) > 1 else last
-    return {
-        "bullish":    last > sh and prev <= sh,
-        "bearish":    last < sl_ and prev >= sl_,
-        "swing_high": sh,
-        "swing_low":  sl_,
-        "price":      last,
-    }
-
-def detect_fvg(ohlcv, min_size=0.30):
-    _, highs, lows, closes = ohlcv
-    bull_fvgs, bear_fvgs = [], []
-    for i in range(2, min(len(closes)-1, 20)):
-        idx_prev = -(i+1)
-        idx_next = -(i-1)
-        prev_high = highs[idx_prev]
-        prev_low  = lows[idx_prev]
-        next_low  = lows[idx_next]
-        next_high = highs[idx_next]
-        if next_low > prev_high and (next_low - prev_high) >= min_size:
-            bull_fvgs.append({"upper": next_low, "lower": prev_high,
-                               "mid": (next_low + prev_high) / 2})
-        if next_high < prev_low and (prev_low - next_high) >= min_size:
-            bear_fvgs.append({"upper": prev_low, "lower": next_high,
-                               "mid": (prev_low + next_high) / 2})
-    return bull_fvgs, bear_fvgs
-
-def fib_levels(sh, sl, bias):
-    rng = sh - sl
-    if bias == "bull":
-        return {
-            "61.8": sh - rng * 0.618,
-            "70.5": sh - rng * 0.705,
-            "78.6": sh - rng * 0.786,
-            "zone_lo": sh - rng * 0.786,
-            "zone_hi": sh - rng * 0.618,
-        }
-    else:
-        return {
-            "61.8": sl + rng * 0.618,
-            "70.5": sl + rng * 0.705,
-            "78.6": sl + rng * 0.786,
-            "zone_lo": sl + rng * 0.618,
-            "zone_hi": sl + rng * 0.786,
-        }
-
-def in_fib_zone(price, fib):
-    lo = fib["zone_lo"] - abs(fib["zone_hi"] - fib["zone_lo"]) * 0.2
-    hi = fib["zone_hi"] + abs(fib["zone_hi"] - fib["zone_lo"]) * 0.2
-    return lo <= price <= hi
-
-def in_fvg(price, fvgs):
-    for f in fvgs:
-        if f["lower"] <= price <= f["upper"]:
-            return f
-    return None
-
-def active_session():
-    h = datetime.now(timezone.utc).hour
-    if 12 <= h < 16: return True, "🔥 London/NY Overlap"
-    if  7 <= h < 12: return True, "🇬🇧 London Session"
-    if 16 <= h < 20: return True, "🇺🇸 New York Session"
-    return False, "😴 Off-Hours"
-
-# ═══════════════════════════════════════════════════════════════════
-# SIGNAL ENGINE
-# ═══════════════════════════════════════════════════════════════════
-
-def generate_signal(m5, m15, h1):
+    hdef generate_signal(m5, m15, h1):
     _, h5,  l5,  c5  = m5
     _, h15, l15, c15 = m15
 
     bias         = htf_bias(h1)
-    sess_ok, sess= active_session()
+    sess_ok, sess = active_session()
     if not sess_ok or bias == "neutral":
         return None
 
-    price   = c5[-1]
-    atr_val = atr(h5, l5, c5)
-    rsi_val = rsi(c15)
-    e21     = ema(c15, 21)
-    e50     = ema(c15, 50)
-    bos     = detect_bos(m15)
-    sh      = bos["swing_high"]
-    sl_     = bos["swing_low"]
-    fib     = fib_levels(sh, sl_, bias)
+    price    = c5[-1]
+    atr_val  = atr(h5, l5, c5)
+    rsi_val  = rsi(c15)
+    e21      = ema(c15, 21)
+    e50      = ema(c15, 50)
+    bos      = detect_bos(m15)
+    sh       = bos["swing_high"]
+    sl_      = bos["swing_low"]
+    fib      = fib_levels(sh, sl_, bias)
     bull_fvg, bear_fvg = detect_fvg(m5)
 
     if bias == "bull":
-        in_fib   = in_fib_zone(price, fib)
-        fvg_hit  = in_fvg(price, bull_fvg)
-        ema_ok   = e21 > e50 and price > e21
-        bos_ok   = bos["bullish"] or price > sh * 0.998
-        rsi_ok   = 40 < rsi_val < 70
-        score    = sum([in_fib, fvg_hit is not None, ema_ok, bos_ok, rsi_ok])
-
+        in_fib  = in_fib_zone(price, fib)
+        fvg_hit = in_fvg(price, bull_fvg)
+        ema_ok  = e21 > e50 and price > e21
+        bos_ok  = bos["bullish"] or price > sh * 0.998
+        rsi_ok  = 40 < rsi_val < 70
+        score   = sum([in_fib, fvg_hit is not None, ema_ok, bos_ok, rsi_ok])
         if score >= 3 and in_fib and ema_ok:
             sl_price = price - atr_val * ATR_SL_MULT
             tp_price = price + (price - sl_price) * RISK_REWARD
@@ -224,23 +103,21 @@ def generate_signal(m5, m15, h1):
                 "direction": "BUY", "price": price,
                 "sl": sl_price, "tp": tp_price,
                 "atr": atr_val, "rsi": rsi_val,
-                "e21": e21, "e50": e50,
                 "session": sess, "bias": bias,
                 "bos_level": sh, "fib": fib,
                 "fvg": fvg_hit, "score": score,
                 "hits": {"BOS": bos_ok, "FIB": in_fib,
                          "FVG": fvg_hit is not None,
-                         "EMA": ema_ok,  "RSI": rsi_ok},
+                         "EMA": ema_ok, "RSI": rsi_ok},
             }
 
     if bias == "bear":
-        in_fib   = in_fib_zone(price, fib)
-        fvg_hit  = in_fvg(price, bear_fvg)
-        ema_ok   = e21 < e50 and price < e21
-        bos_ok   = bos["bearish"] or price < sl_ * 1.002
-        rsi_ok   = 30 < rsi_val < 60
-        score    = sum([in_fib, fvg_hit is not None, ema_ok, bos_ok, rsi_ok])
-
+        in_fib  = in_fib_zone(price, fib)
+        fvg_hit = in_fvg(price, bear_fvg)
+        ema_ok  = e21 < e50 and price < e21
+        bos_ok  = bos["bearish"] or price < sl_ * 1.002
+        rsi_ok  = 30 < rsi_val < 60
+        score   = sum([in_fib, fvg_hit is not None, ema_ok, bos_ok, rsi_ok])
         if score >= 3 and in_fib and ema_ok:
             sl_price = price + atr_val * ATR_SL_MULT
             tp_price = price - (sl_price - price) * RISK_REWARD
@@ -248,21 +125,14 @@ def generate_signal(m5, m15, h1):
                 "direction": "SELL", "price": price,
                 "sl": sl_price, "tp": tp_price,
                 "atr": atr_val, "rsi": rsi_val,
-                "e21": e21, "e50": e50,
                 "session": sess, "bias": bias,
                 "bos_level": sl_, "fib": fib,
                 "fvg": fvg_hit, "score": score,
                 "hits": {"BOS": bos_ok, "FIB": in_fib,
                          "FVG": fvg_hit is not None,
-                         "EMA": ema_ok,  "RSI": rsi_ok},
+                         "EMA": ema_ok, "RSI": rsi_ok},
             }
-    return None
-
-# ═══════════════════════════════════════════════════════════════════
-# MESSAGE BUILDER
-# ═══════════════════════════════════════════════════════════════════
-
-def build_message(sig):
+    return Nonedef build_message(sig):
     d     = sig["direction"]
     icon  = "🟢" if d == "BUY" else "🔴"
     arrow = "📈" if d == "BUY" else "📉"
@@ -273,37 +143,29 @@ def build_message(sig):
     now   = datetime.now(timezone.utc).strftime("%d %b %Y  %H:%M UTC")
     chart = "https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD&interval=5"
 
-    return f"""
-{icon}{icon} *XAUUSD {d} SIGNAL* {icon}{icon}
-{arrow} *Smart Money Confluence*
-━━━━━━━━━━━━━━━━━━━━━━
-🕐 *Time:* {now}
-📍 *Session:* {sig['session']}
-🧭 *HTF Bias:* {'BULLISH ▲' if sig['bias']=='bull' else 'BEARISH ▼'}
-
-💰 *ENTRY:* `{sig['price']:.2f}`
-🛑 *STOP LOSS:* `{sig['sl']:.2f}` _({sl_dist:.1f} pts)_
-🎯 *TAKE PROFIT:* `{sig['tp']:.2f}`
-⚖️ *Risk:Reward:* `1 : {RISK_REWARD:.1f}`
-━━━━━━━━━━━━━━━━━━━━━━
-📊 *CONFLUENCE* ({sig['score']}/5)
-{chk('BOS')} Break of Structure @ `{sig['bos_level']:.2f}`
-{chk('FIB')} Fib 61.8–78.6% Zone `{fib['zone_lo']:.2f}–{fib['zone_hi']:.2f}`
-{chk('FVG')} Fair Value Gap
-{chk('EMA')} EMA 21/50 Alignment
-{chk('RSI')} RSI Momentum `{sig['rsi']:.1f}`
-━━━━━━━━━━━━━━━━━━━━━━
-📏 *ATR:* `{sig['atr']:.2f}`
-📈 *[LIVE CHART →]({chart})*
-━━━━━━━━━━━━━━━━━━━━━━
-⚠️ _Max 1–2% risk per trade. Always use SL._
-""".strip()
-
-# ═══════════════════════════════════════════════════════════════════
-# MAIN LOOP
-# ═══════════════════════════════════════════════════════════════════
-
-async def run_bot():
+    return (
+        f"{icon}{icon} *XAUUSD {d} SIGNAL* {icon}{icon}\n"
+        f"{arrow} *Smart Money Confluence*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 *Time:* {now}\n"
+        f"📍 *Session:* {sig['session']}\n"
+        f"🧭 *HTF Bias:* {'BULLISH ▲' if sig['bias']=='bull' else 'BEARISH ▼'}\n\n"
+        f"💰 *ENTRY:* `{sig['price']:.2f}`\n"
+        f"🛑 *STOP LOSS:* `{sig['sl']:.2f}` _({sl_dist:.1f} pts)_\n"
+        f"🎯 *TAKE PROFIT:* `{sig['tp']:.2f}`\n"
+        f"⚖️ *Risk:Reward:* `1 : {RISK_REWARD:.1f}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *CONFLUENCE* ({sig['score']}/5)\n"
+        f"{chk('BOS')} Break of Structure @ `{sig['bos_level']:.2f}`\n"
+        f"{chk('FIB')} Fib 61.8-78.6% `{fib['zone_lo']:.2f}-{fib['zone_hi']:.2f}`\n"
+        f"{chk('FVG')} Fair Value Gap\n"
+        f"{chk('EMA')} EMA 21/50 Alignment\n"
+        f"{chk('RSI')} RSI Momentum `{sig['rsi']:.1f}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📏 *ATR:* `{sig['atr']:.2f}`\n"
+        f"📈 *[LIVE CHART]({chart})*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _Max 1-2% risk per trade. Always use SL._"async def run_bot():
     global last_signal_key
     bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -343,7 +205,7 @@ async def run_bot():
                             disable_web_page_preview=False
                         )
                         last_signal_key = key
-                        log.info(f"✅ Signal sent: {sig['direction']} @ {price:.2f} | Score {sig['score']}/5")
+                        log.info(f"Signal sent: {sig['direction']} @ {price:.2f}")
                     else:
                         log.info("Duplicate signal — skipped.")
                 else:
@@ -364,3 +226,4 @@ async def run_bot():
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
+)
